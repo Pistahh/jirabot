@@ -1,0 +1,10 @@
+*.swn
+*.swo
+*.swp
+*.pyc
+bin
+etc
+include
+lib
+local
+
