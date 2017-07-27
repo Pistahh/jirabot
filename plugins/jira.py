@@ -8,6 +8,9 @@ import jira
 import logging
 from collections import defaultdict
 import os
+import sys
+
+DESC_LEN = 160
 
 LOGGER = logging.getLogger(__name__)
 LOGGER.setLevel(logging.DEBUG)
@@ -25,7 +28,9 @@ class JiraPlugin(Plugin):
         self.chans = {}
         for chan in ld["channels"]:
             d = {
-                "name": chan["name"]
+                "name": chan["name"],
+                "hushed": False,
+                "verbose": True
             }
 
             try:
@@ -39,24 +44,24 @@ class JiraPlugin(Plugin):
         if jira_user is None or jira_pass is None:
             sys.exit("JIRA_USER or JIRA_PASSWORD is not set")
         self.jira = jira.JIRA("https://issues.citrite.net", basic_auth=(jira_user, jira_pass))
-        self.chanissues=defaultdict(int)
-        self.chanmsgs=defaultdict(int)
+        self.chanissues = defaultdict(int)
+        self.chanmsgs = defaultdict(int)
 
     def get_issue(self, issue):
         LOGGER.debug("Trying to get issue %s", issue)
         i = self.jira.issue(issue)
         data = {
-            'url': 'N/A',
+            'url': None,
             'issue': issue,
-            'description': 'N/A',
-            'status': 'N/A',
-            'summary': 'N/A',
-            'priority': 'N/A',
-            'priority_iconurl': 'N/A',
-            'issuetype': 'N/A',
-            'issuetype_iconurl': 'N/A',
-            'creator': 'N/A',
-            'assignee': 'N/A'
+            'description': None,
+            'status': None,
+            'summary': None,
+            'priority': None,
+            'priority_iconurl': None,
+            'issuetype': None,
+            'issuetype_iconurl': None,
+            'creator': None,
+            'assignee': None
         }
 
         try:
@@ -100,12 +105,12 @@ class JiraPlugin(Plugin):
             pass
 
         try:
-            data['creator'] = i.fields.creator.displayName
+            data['creator'] = i.fields.creator.name
         except:
             pass
 
         try:
-            data['assignee'] = i.fields.assignee.displayName
+            data['assignee'] = i.fields.assignee.name
         except:
             pass
 
@@ -113,6 +118,77 @@ class JiraPlugin(Plugin):
         return data
         #except jira.exceptions.JIRAERROR:
         #    pass
+
+    def send_issue_verbose(self, channel_id, idata):
+        att = [
+                {
+                    "text": idata["description"],
+                    "fields": [
+                        {
+                            "title": "Status",
+                            "value": idata["status"] or "N/A",
+                            "short": True
+                        },
+                        {
+                            "title": "Priority",
+                            "value": idata["priority"] or "N/A",
+                            "short": True
+                        },
+                        {
+                            "title": "Created by",
+                            "value": idata["creator"] or "N/A",
+                            "short": True
+                        },
+                        {
+                            "title": "Assigned to",
+                            "value": idata["assignee"] or "N/A",
+                            "short": True
+                        }
+                    ],
+                }
+            ]
+        LOGGER.debug("Sending message with issue data")
+        self.slack_client.api_call("chat.postMessage",
+                                    channel=channel_id,
+                                    as_user=True,
+                                    text="<{}|{}> {}".format(idata['url'], idata["issue"], idata["summary"] or ""),
+                                    attachments=att)
+
+    def send_issue_simple(self, channel_id, idata):
+
+        msg = "<{}|{}>".format(idata['url'], idata["issue"])
+
+        l = []
+        if idata["status"]: l.append(idata["status"])
+        if idata["priority"] and idata["priority"] != "Unset": l.append(idata["priority"])
+        if idata["issuetype"]: l.append(idata["issuetype"])
+
+        cre = idata["creator"]
+        ass = idata["assignee"]
+
+        if cre: cre = "@{}".format(cre)
+        if ass: ass = "@{}".format(ass)
+        if cre == ass:
+            ctoa = cre
+        else:
+            ctoa = "{} -> {}".format(cre or "", ass or "")
+
+
+        desc = idata["description"] or ""
+
+        desc = re.sub( '\s+', ' ', desc).strip()
+
+        if len(desc) > DESC_LEN:
+            desc = desc[:DESC_LEN].rsplit(' ', 1)[0]+"..."
+
+        msg += " *{}* [{} | {}]\n{}".format(idata["summary"], " ".join(l), ctoa, desc)
+        LOGGER.debug("Sending message with issue data")
+        LOGGER.debug("MSG=%s", msg)
+        self.slack_client.api_call("chat.postMessage",
+                                    channel=channel_id,
+                                    as_user=True,
+                                    link_names=1,
+                                    text=msg)
 
     def process_message(self, data):
         try:
@@ -156,32 +232,45 @@ class JiraPlugin(Plugin):
                                                as_user=True,
                                                text="Debug is now off")
                     return
+                if text == "debug off":
+                    LOGGER.debug("turning debug off")
+                    LOGGER.setLevel(logging.INFO)
+                    self.slack_client.api_call("chat.postMessage",
+                                               channel=channel_id,
+                                               as_user=True,
+                                               text="Debug is now off")
+                    return
+
                 self.slack_client.api_call("chat.postMessage",
                                            channel=channel_id,
                                            as_user=True,
-                                           text="huh?")
+                                           text="For help please see https://info.citrite.net/display/JIRA/Jirabot")
                 return
 
             if not channel_id in self.chans:
                 self.chans[channel_id] = {
                     "name": "somethingnew, need to fetch :-)",
+                    "hushed": False,
+                    "verbose": True,
                     "latest_ts": '0'
                 }
 
             channel = self.chans[channel_id]
             channel_name = channel["name"]
             LOGGER.debug("Channel: %s", channel_name)
-#            if channel_id != 'C58SGNMEK':
-#                print("Ignoring channel {}".format(channel_name))
-#                return
             if data['ts'] <= channel["latest_ts"]:
                 LOGGER.debug("Ignoring old message")
                 return
 
             self.chanmsgs[channel_name] += 1
 
-            LOGGER.debug("Searching for issue patterns")
-            m = ISSUE_RE.findall(data['text'])
+            text = data['text']
+            if channel['hushed']:
+                m = []
+            else:
+                LOGGER.debug("Searching for issue patterns")
+                m = ISSUE_RE.findall(text)
+
             for issue in m:
                 LOGGER.debug("Found issue id=%s", issue)
                 lastseen = self.chanissues["%s::%s" % (channel_name, issue)]
@@ -195,40 +284,52 @@ class JiraPlugin(Plugin):
 
                 idata = self.get_issue(issue)
                 if idata:
-                    att = [
-                            {
-                                "text": idata["description"],
-                                "fields": [
-                                    {
-                                        "title": "Status",
-                                        "value": idata["status"],
-                                        "short": True
-                                    },
-                                    {
-                                        "title": "Priority",
-                                        "value": idata["priority"],
-                                        "short": True
-                                    },
-                                    {
-                                        "title": "Created by",
-                                        "value": idata["creator"],
-                                        "short": True
-                                    },
-                                    {
-                                        "title": "Assigned to",
-                                        "value": idata["assignee"],
-                                        "short": True
-                                    }
-                                ],
-                            }
-                        ]
-                    LOGGER.debug("Sending message with issue data")
-                    self.slack_client.api_call("chat.postMessage",
-                                               channel=channel_id,
-                                               as_user=True,
-                                               text="<{}|{}> {}".format(idata['url'], issue, idata["summary"]),
-                                               attachments=att)
-            LOGGER.debug(self.chanissues)
+                    if channel.get('verbose', True):
+                        self.send_issue_verbose(channel_id, idata)
+                    else:
+                        self.send_issue_simple(channel_id, idata)
+
+            if "jirabot" in text and "evanesco" in text:
+                LOGGER.debug("leaving channel %s", channel_id)
+                res = self.slack_client.api_call("channels.leave",
+                                           channel=channel_id)
+                LOGGER.debug("RES=%s", res)
+                return
+            if "jirabot" in text and "hush" in text:
+                LOGGER.debug("Keeping channel %s quiet", channel_id)
+                channel['hushed'] = True
+                return
+
+            if "jirabot" in text and "talk" in text:
+                LOGGER.debug("Talking again in channel %s", channel_id)
+                channel['hushed'] = False
+                return
+
+            if "jirabot" in text and "verbose on" in text:
+                LOGGER.debug("Setting verbose on in channel %s", channel_id)
+                channel['verbose'] = True
+                return
+
+            if "jirabot" in text and "verbose off" in text:
+                LOGGER.debug("Setting verbose off in channel %s", channel_id)
+                channel['verbose'] = False
+                return
+
+            if "jirabot" in text and "help" in text:
+                self.slack_client.api_call("chat.postMessage",
+                                           channel=channel_id,
+                                           as_user=True,
+                                           text="You may find help at https://info.citrite.net/display/JIRA/Jirabot")
+                return
+            if "jirabot" in text and "ping" in text:
+                self.slack_client.api_call("chat.postMessage",
+                                           channel=channel_id,
+                                           as_user=True,
+                                           text="Pong :)")
+                return
+
+
+
         except Exception as e:
             LOGGER.debug("Got EXCEPTION: %s", e)
 
